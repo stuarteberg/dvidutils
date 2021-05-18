@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <tuple>
 #include <algorithm>
+#include <iostream>
 
 #include "draco/mesh/mesh.h"
 #include "draco/compression/encode.h"
@@ -22,13 +23,59 @@ namespace py = pybind11;
 typedef xt::pytensor<float, 2> vertices_array_t;
 typedef xt::pytensor<float, 2> normals_array_t;
 typedef xt::pytensor<uint32_t, 2> faces_array_t;
+typedef xt::pytensor<int, 1> coords_t;
+/*
+-DCMAKE_BUILD_TYPE=Debug     -DCMAKE_CXX_FLAGS_DEBUG="-g -O0 -DXTENSOR_ENABLE_ASSERT=ON"     -DCMAKE_PREFIX_PATH="${CONDA_PREFIX}" -DCMAKE_CXX_FLAGS=-I/groups/scicompsoft/home/ackermand/miniconda3/envs/multiresolution/include/python3.7m/pybind11
+*/
+struct Quantizer {
+  // Constructs a quantizer.
+  //
+  // \param fragment_origin Minimum input vertex position to represent.
+  // \param fragment_shape The inclusive maximum vertex position to represent
+  //     is `fragment_origin + fragment_shape`.
+  // \param input_origin The offset to add to input vertices before quantizing
+  //     them within the `[fragment_origin, fragment_origin+fragment_shape]`
+  //     range.
+  // \param num_quantization_bits The number of bits to use for quantization.
+  //     A value of `0` for coordinate `i` corresponds to `fragment_origin[i]`,
+  //     while a value of `2**num_quantization_bits-1` corresponds to
+  //     `fragment_origin[i]+fragment_shape[i]`.  Should be less than or equal
+  //     to the number of bits in `VertexCoord`.
+  Quantizer(coords_t const & fragment_shape, coords_t const & fragment_origin, int num_quantization_bits) {
+      //assumes has been scaled between 0 and 1
+        for (int i = 0; i < 3; ++i) {
+            upper_bound[i] =
+                static_cast<double>(std::numeric_limits<uint32_t>::max() >>
+                                    (sizeof(uint32_t) * 8 - num_quantization_bits));
+            fragment_shape_double[i] = static_cast<double>(fragment_shape[i]);
+            //scale[i] = upper_bound[i] / static_cast<float>(fragment_shape[i]);
+            offset[i] = fragment_origin[i] ;//mesh_origin[i] - fragment_origin[i] + 0.5 / scale[i];
+        }
+  }
 
+  // Maps an input vertex position `v_pos`.
+  std::array<uint32_t, 3> operator()(std::array<float, 3>& v_pos) {
+    for (int i = 0; i < 3; ++i) {
+      output[i] = static_cast<uint32_t>(std::min(
+          //might need to further fix this due to rounding artifacts which set eg a value to 511 when it should be 512. that is why i moved scale out here
+          upper_bound[i], std::max(0.0, (v_pos[i] - offset[i]) * upper_bound[i] / fragment_shape_double[i] + 0.5))); // Add 0.5 to round to nearest rather than round down.
+    }
+    return output;
+  }
+
+  std::array<uint32_t, 3> output;
+  std::array<double, 3> offset;
+  std::array<double, 3> scale;
+  std::array<double, 3> upper_bound;
+  std::array<double, 3> fragment_shape_double; 
+};
 
 // Defaults from the draco_encoder command-line tool.
 int DEFAULT_COMPRESSION_LEVEL = 7;
 int DEFAULT_POSITION_QUANTIZATION_BITS = 14;
 int DEFAULT_NORMAL_QUANTIZATION_BITS = 10;
 int DEFAULT_GENERIC_QUANTIZATION_BITS = 8;
+bool DEFAULT_DO_CUSTOM = true;
 
 
 // Encode the given vertices and faces arrays from python
@@ -37,19 +84,27 @@ int DEFAULT_GENERIC_QUANTIZATION_BITS = 8;
 // Special case: If faces is empty, an empty buffer is returned.
 //
 // Note: The vertices are expected to be passed in X,Y,Z order
-py::bytes encode_faces_to_drc_bytes( vertices_array_t const & vertices,
+
+py::bytes encode_faces_to_custom_drc_bytes( vertices_array_t const & vertices,
                                      normals_array_t const & normals,
                                      faces_array_t const & faces,
+                                     coords_t const & fragment_shape,
+                                     coords_t const & fragment_origin,
                                      int compression_level,
                                      int position_quantization_bits,
                                      int normal_quantization_bits,
-                                     int generic_quantization_bits)
+                                     int generic_quantization_bits,
+                                     bool do_custom)
 {
     using namespace draco;
+    DataType data_type = do_custom ? DT_UINT32 : DT_FLOAT32;
 
     auto vertex_count = vertices.shape()[0];
-    auto normal_count = normals.shape()[0];
+    auto normal_count = do_custom ? 0 :normals.shape()[0]; //FOR CUSTOM IGNORE NORMALS, SCREWS UP DECODING
     auto face_count = faces.shape()[0];
+
+    Quantizer quantizer(fragment_shape, fragment_origin, position_quantization_bits);
+
 
     // Special case:
     // If faces is empty, an empty buffer is returned.
@@ -79,16 +134,17 @@ py::bytes encode_faces_to_drc_bytes( vertices_array_t const & vertices,
         Mesh mesh;
         mesh.set_num_points(vertex_count);
         mesh.SetNumFaces(face_count);
-    
+        
         // Init vertex attribute
         PointAttribute vert_att_template;
         vert_att_template.Init( GeometryAttribute::POSITION,    // attribute_type
                                 nullptr,                        // buffer
                                 3,                              // num_components
-                                DT_FLOAT32,                     // data_type
+                                data_type,                     // data_type
                                 false,                          // normalized
-                                DataTypeLength(DT_FLOAT32) * 3, // byte_stride
+                                DataTypeLength(data_type) * 3, // byte_stride
                                 0 );                            // byte_offset
+        
         vert_att_template.SetIdentityMapping();
 
         // Add vertex attribute to mesh (makes a copy internally)
@@ -102,7 +158,13 @@ py::bytes encode_faces_to_drc_bytes( vertices_array_t const & vertices,
         for (size_t vi = 0; vi < vertex_count; ++vi)
         {
             std::array<float, 3> v{{ vertices(vi, 0), vertices(vi, 1), vertices(vi, 2) }};
-            vert_att.SetAttributeValue(AttributeValueIndex(vi), v.data());
+            if(do_custom){
+                std::array<uint32_t,3> quantized_v = quantizer(v);
+                vert_att.SetAttributeValue(AttributeValueIndex(vi), quantized_v.data());
+            }
+            else{
+                vert_att.SetAttributeValue(AttributeValueIndex(vi), v.data());
+            }
         }
         
         if (normal_count > 0)
@@ -156,7 +218,7 @@ py::bytes encode_faces_to_drc_bytes( vertices_array_t const & vertices,
         int speed = 10 - compression_level;
         encoder.SetSpeedOptions(speed, speed);
         encoder.SetAttributeQuantization(draco::GeometryAttribute::POSITION, position_quantization_bits);
-        encoder.SetAttributeQuantization(draco::GeometryAttribute::NORMAL,   normal_quantization_bits);
+        if(!do_custom) encoder.SetAttributeQuantization(draco::GeometryAttribute::NORMAL,   normal_quantization_bits);
         encoder.SetAttributeQuantization(draco::GeometryAttribute::GENERIC,  generic_quantization_bits);
 
         encoder.EncodeMeshToBuffer(mesh, &buf);
@@ -164,6 +226,20 @@ py::bytes encode_faces_to_drc_bytes( vertices_array_t const & vertices,
     
     // Safe to use python again now that the GIL is re-acquired.
     return py::bytes(buf.data(), buf.size());
+}
+py::bytes encode_faces_to_drc_bytes( vertices_array_t const & vertices,
+                                     normals_array_t const & normals,
+                                     faces_array_t const & faces,
+                                     int compression_level,
+                                     int position_quantization_bits,
+                                     int normal_quantization_bits,
+                                     int generic_quantization_bits)
+{
+    coords_t fragment_shape = xt::zeros<int>({3});
+    coords_t fragment_origin = xt::zeros<int>({3});
+
+    bool do_custom = false;
+    return encode_faces_to_custom_drc_bytes(vertices, normals, faces, fragment_shape, fragment_origin, compression_level, position_quantization_bits, normal_quantization_bits, generic_quantization_bits, do_custom);
 }
 
 // Decode a draco-encoded buffer (given as a python bytes object)

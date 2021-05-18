@@ -2,6 +2,9 @@
 .ipynb_checkpoints/
 dist/
 build/
+backupBuild2/
+backupBuild3/
+src/include/
 *.py[cod]
 
 # OS X
@@ -17,8 +20,10 @@ _generate/
 .cproject
 .settings
 
+#vscode
+.vscode
+
 # pytest
 .cache
-
 
 /Debug/
